@@ -1,0 +1,13 @@
+datasets
+peft
+Levenshtein
+deepspeed
+bitsandbytes
+flash_attn
+numpy
+Pillow
+Requests
+torch
+torchvision
+transformers
+accelerate
