@@ -22,8 +22,8 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import gather_object
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from tqdm import tqdm
+from .prepare_dataset import create_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
@@ -61,21 +61,6 @@ DS_CONFIG_DICT = {
 
 
 IGNORE_INDEX = -100
-
-
-def create_dataset(eval_size=500):
-    """
-    NLVR2 dataset from the Hugging Face Hub
-    """
-    train_dataset = load_dataset(
-        'HuggingFaceM4/the_cauldron', 'nlvr2', split=f'train[{eval_size}:]', cache_dir="/scratch/09697/luosong/cache"
-    )
-    eval_dataset = load_dataset(
-        'HuggingFaceM4/the_cauldron', 'nlvr2', split=f'train[:{eval_size}]', cache_dir="/scratch/09697/luosong/cache"
-    )
-
-    return train_dataset, eval_dataset
-
 
 def create_lora_config(rank, alpha_to_rank_ratio=2.0, dropout=0.0, freeze_vision_model=False):
     linear_modules = [
