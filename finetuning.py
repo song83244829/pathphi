@@ -17,13 +17,15 @@ import argparse
 import json
 import os
 from pathlib import Path
+import glob
 
 import torch
 from accelerate import Accelerator
 from accelerate.utils import gather_object
 from datasets import load_dataset
 from tqdm import tqdm
-from .prepare_dataset import create_dataset
+from peft import LoraConfig
+from prepare_dataset import create_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
@@ -31,6 +33,8 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+
+from phi3v_dataset import Phi3VDataCollator, Phi3VEvalDataCollator
 
 # suggested deepspeed config
 DS_CONFIG_DICT = {
@@ -119,85 +123,10 @@ def create_model(model_name_or_path, use_flash_attention=False, use_qlora=False)
 
     return model
 
-
-class DataCollator:
-    def __init__(self, processor):
-        self.processor = processor
-
-    def __call__(self, examples):
-        all_input_ids = []
-        all_label_ids = []
-        all_pixel_values = []
-        all_image_sizes = []
-        for example in examples:
-            assert len(example['images']) == 2, 'NLVR2 dataset should have 2 images'
-            image_1 = example['images'][0]
-            image_2 = example['images'][1]
-            ex_input_ids = []
-            ex_label_ids = []
-            for i, text_dict in enumerate(example['texts']):
-                question = text_dict['user']
-                answer = text_dict['assistant']
-                prompt_message = {
-                    'role': 'user',
-                    'content': f'<|image_1|><|image_2|>\n{question}' if i == 0 else question,
-                }
-
-                prompt = self.processor.tokenizer.apply_chat_template(
-                    [prompt_message], tokenize=False, add_generation_prompt=True
-                )
-                answer = f'{answer}<|end|>\n<|endoftext|>'
-
-                # mask questions for labels
-                images = [image_1, image_2] if i == 0 else None
-                inputs = self.processor(prompt, images, return_tensors='pt')
-                prompt_input_ids = inputs['input_ids']
-                # Do not add bos token to answer
-                answer_input_ids = self.processor.tokenizer(
-                    answer, add_special_tokens=False, return_tensors='pt'
-                )['input_ids']
-
-                ex_input_ids.extend([prompt_input_ids, answer_input_ids])
-                ex_label_ids.extend(
-                    [
-                        torch.tensor([IGNORE_INDEX] * len(prompt_input_ids[0])),
-                        answer_input_ids.squeeze(0),
-                    ]
-                )
-
-                if i == 0:
-                    all_pixel_values.append(inputs['pixel_values'])
-                    all_image_sizes.append(inputs['image_sizes'])
-
-            input_ids = torch.cat(ex_input_ids, dim=1)
-            labels = torch.cat(ex_label_ids, dim=0)
-
-            # prepare expected shape for pad_sequence
-            all_input_ids.append(input_ids.squeeze(0).unsqueeze(1))
-            all_label_ids.append(labels.unsqueeze(1))
-
-        input_ids = torch._C._nn.pad_sequence(
-            all_input_ids, batch_first=True, padding_value=self.processor.tokenizer.pad_token_id
-        ).squeeze(2)
-        labels = torch._C._nn.pad_sequence(
-            all_label_ids, batch_first=True, padding_value=IGNORE_INDEX
-        ).squeeze(2)
-        attention_mask = input_ids.ne(self.processor.tokenizer.pad_token_id)
-        pixel_values = torch.cat(all_pixel_values, dim=0)
-        image_sizes = torch.cat(all_image_sizes, dim=0)
-
-        inputs = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels,
-            'pixel_values': pixel_values,
-            'image_sizes': image_sizes,
-        }
-        return inputs
-
-
 @torch.no_grad()
-def evaluate(model, processor, eval_dataset, save_path=None, disable_tqdm=False):
+def evaluate(
+    model, processor, eval_dataset, save_path=None, disable_tqdm=False, eval_batch_size=1
+):
     rank = int(os.environ.get('RANK', 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -206,46 +135,39 @@ def evaluate(model, processor, eval_dataset, save_path=None, disable_tqdm=False)
     answers_unique = []
     generated_texts_unique = []
 
-    eval_dataset_shard = eval_dataset.shard(num_shards=world_size, index=rank)
-    for i in tqdm(range(len(eval_dataset_shard)), disable=(rank != 0) or disable_tqdm):
-        # Phi-3-V currently only supports batch_size == 1
-        example = eval_dataset_shard[i]
-        assert len(example['images']) == 2, 'NLVR2 dataset should have 2 images'
-        image_1 = example['images'][0]
-        image_2 = example['images'][1]
-        text_dict = example['texts'][0]  # only consider first question for evaluation
-
-        answer = text_dict['assistant']
-        answers_unique.append(answer)
-
-        question = text_dict['user']
-        prompt_message = {
-            'role': 'user',
-            'content': f'<|image_1|><|image_2|>\n{question}',
-        }
-
-        prompt = processor.tokenizer.apply_chat_template(
-            [prompt_message], tokenize=False, add_generation_prompt=True
+    eval_dataset_shard = eval_dataset.shard(world_size, rank)
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset_shard,
+        batch_size=eval_batch_size,
+        collate_fn=Phi3VEvalDataCollator(processor.tokenizer.pad_token_id),
+        shuffle=False,
+        drop_last=False,
+        num_workers=4,
+        prefetch_factor=2,
+        pin_memory=True,
+    )
+    for batch in tqdm(eval_dataloader, disable=(rank != 0) or disable_tqdm):
+        unique_ids = batch.pop('unique_ids')
+        answers = batch.pop('answers')
+        answers_unique.extend(
+            {'id': i, 'answer': a.strip().strip('.').lower()} for i, a in zip(unique_ids, answers)
         )
 
-        inputs = processor(prompt, [image_1, image_2], return_tensors='pt').to(
-            f'cuda:{local_rank}'
-        )
-        
+        inputs = {k: v.to(f'cuda:{local_rank}') for k, v in batch.items()}
         generated_ids = model.generate(
             **inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=64
         )
 
+        input_len = inputs['input_ids'].size(1)
         generated_texts = processor.batch_decode(
-            generated_ids[:, inputs['input_ids'].size(1) :],
+            generated_ids[:, input_len:],
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        generated_texts_unique.extend(generated_texts)
-
-    # strip whitespace, period and then lowercase
-    generated_texts_unique = [g.strip().strip('.').lower() for g in generated_texts_unique]
-    answers_unique = [a.strip().strip('.').lower() for a in answers_unique]
+        generated_texts_unique.extend(
+            {'id': i, 'generated_text': g.strip().strip('.').lower()}
+            for i, g in zip(unique_ids, generated_texts)
+        )
 
     # gather outputs from all ranks
     answers_unique = gather_object(answers_unique)
@@ -253,9 +175,10 @@ def evaluate(model, processor, eval_dataset, save_path=None, disable_tqdm=False)
 
     if rank == 0:
         assert len(answers_unique) == len(generated_texts_unique)
-        acc = sum(a == g for a, g in zip(answers_unique, generated_texts_unique)) / len(
-            answers_unique
-        )
+        acc = sum(
+            a['answer'] == g['generated_text']
+            for a, g in zip(answers_unique, generated_texts_unique)
+        ) / len(answers_unique)
         if save_path:
             with open(save_path, 'w') as f:
                 save_dict = {
@@ -275,7 +198,7 @@ def patch_clip_for_lora(model):
         clip_vision_model = self.img_processor.vision_model
         hidden_states = clip_vision_model.embeddings(img_embeds)
         hidden_states = clip_vision_model.pre_layrnorm(hidden_states)
-        hidden_states = hidden_states.bfloat16()
+        
         patch_feature = clip_vision_model.encoder(
             inputs_embeds=hidden_states, output_hidden_states=True
         ).hidden_states[-1][:, 1:]
@@ -299,6 +222,7 @@ def main():
         default='microsoft/Phi-3.5-vision-instruct',
         help='Model name or path to load from',
     )
+    parser.add_argument('--data_dir', type=str, required=True, help='Path to UCF-101 dataset')
     parser.add_argument('--use_flash_attention', action='store_true', help='Use Flash Attention')
     parser.add_argument('--bf16', action='store_true', help='Use BF16')
     parser.add_argument('--use_lora', action='store_true', help='Use LoRA')
@@ -347,7 +271,7 @@ def main():
             use_qlora=args.use_qlora,
         )
 
-    train_dataset, eval_dataset = create_dataset()
+    train_dataset, eval_dataset = create_dataset(args.data_dir, processor)
 
     num_gpus = accelerator.num_processes
     print(f'training on {num_gpus} GPUs')
@@ -378,11 +302,15 @@ def main():
         max_grad_norm=1.0,
         lr_scheduler_type='linear',
         warmup_steps=50,
+        logging_dir=os.path.join(args.output_dir, "runs"),
+        logging_strategy="steps",
         logging_steps=10,
         output_dir=args.output_dir,
-        save_strategy='no',
+        overwrite_output_dir=True,
+        save_strategy='epoch',
         save_total_limit=10,
-        save_only_model=True,
+        save_only_model=False,
+        save_on_each_node=False,
         bf16=bf16,
         fp16=fp16,
         remove_unused_columns=False,
@@ -394,7 +322,7 @@ def main():
         ddp_find_unused_parameters=False,
     )
 
-    data_collator = DataCollator(processor)
+    data_collator = Phi3VDataCollator(pad_token_id=processor.tokenizer.pad_token_id)
 
     # eval before fine-tuning
     out_path = Path(training_args.output_dir)
@@ -403,15 +331,16 @@ def main():
     if not args.use_qlora:
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         model = model.to(f'cuda:{local_rank}')
-    acc = evaluate(
-        model,
-        processor,
-        eval_dataset,
-        save_path=out_path / 'eval_before.json',
-        disable_tqdm=not args.tqdm,
-    )
-    if accelerator.is_main_process:
-        print(f'Accuracy before finetuning: {acc}')
+    # acc = evaluate(
+    #     model,
+    #     processor,
+    #     eval_dataset,
+    #     save_path=out_path / 'eval_before.json',
+    #     disable_tqdm=not args.tqdm,
+    #     eval_batch_size = args.batch_size
+    # )
+    # if accelerator.is_main_process:
+    #     print(f'Accuracy before finetuning: {acc}')
 
     if args.use_lora:
         patch_clip_for_lora(model)
@@ -433,8 +362,10 @@ def main():
         data_collator=data_collator,
         train_dataset=train_dataset,
     )
+
     trainer.train()
     trainer.save_model()
+    
     if accelerator.is_main_process:
         processor.save_pretrained(training_args.output_dir)
     accelerator.wait_for_everyone()

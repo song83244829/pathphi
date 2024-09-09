@@ -24,13 +24,14 @@ def create_dataset(data_dir, processor):
     """
     data_path = Path(data_dir)
     train_dataset = Phi3VDataset(
-        jsonl_file=str(data_path / 'ucf101_train.jsonl'),
-        image_dir=str(data_path / 'images'),
+        jsonl_file=str(data_path / 'quilt_1m_train.jsonl'),
+        image_dir=str(data_path / 'quilt_1m'),
         processor=processor,
     )
+    
     eval_dataset = Phi3VEvalDataset(
-        jsonl_file=str(data_path / 'ucf101_val.jsonl'),
-        image_dir=str(data_path / 'images'),
+        jsonl_file=str(data_path / 'quilt_1m_val.jsonl'),
+        image_dir=str(data_path / 'quilt_1m'),
         processor=processor,
     )
 

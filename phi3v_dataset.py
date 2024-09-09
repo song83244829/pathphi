@@ -46,7 +46,10 @@ class Phi3VDataset(Dataset):
         return sharded
 
     def _get_inputs(self, user_text, image_paths):
-        images = [Image.open(self.image_dir / image_path) for image_path in image_paths]
+        if isinstance(image_paths, list):
+            images = [Image.open(self.image_dir / image_path) for image_path in image_paths]
+        elif isinstance(image_paths, str):
+            images = [Image.open(self.image_dir / image_paths)]
         image_tag_text = ''.join([f'<|image_{i}|>' for i in range(1, len(images) + 1)])
 
         prompt_message = {'role': 'user', 'content': f'{image_tag_text}\n{user_text}'}
@@ -144,8 +147,10 @@ class Phi3VEvalDataset(Phi3VDataset):
             image_paths = turn['images']
             user_text = turn['user']
             assistant_text = turn['assistant']
-
-            images = [Image.open(self.image_dir / image_path) for image_path in image_paths]
+            if isinstance(image_paths, list):
+                images = [Image.open(self.image_dir / image_path) for image_path in image_paths]
+            elif isinstance(image_paths, str):
+                images = [Image.open(self.image_dir / image_paths)]
             image_tag_text = ''.join([f'<|image_{i}|>' for i in range(1, len(images) + 1)])
 
             prompt_message = {'role': 'user', 'content': f'{image_tag_text}\n{user_text}'}
