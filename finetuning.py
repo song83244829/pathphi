@@ -33,7 +33,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-
+from transformers.trainer_utils import get_last_checkpoint
 from phi3v_dataset import Phi3VDataCollator, Phi3VEvalDataCollator
 
 # suggested deepspeed config
@@ -265,11 +265,22 @@ def main():
             num_crops=args.num_crops,
             cache_dir="/scratch/09697/luosong/cache",
         )
-        model = create_model(
-            args.model_name_or_path,
-            use_flash_attention=args.use_flash_attention,
-            use_qlora=args.use_qlora,
-        )
+
+        last_checkpoint_dir = get_last_checkpoint(args.output_dir)
+
+        if last_checkpoint_dir is not None:
+            model = create_model(
+                last_checkpoint_dir,
+                use_flash_attention=args.use_flash_attention,
+                use_qlora=args.use_qlora,
+            )
+
+        else:
+            model = create_model(
+                args.model_name_or_path,
+                use_flash_attention=args.use_flash_attention,
+                use_qlora=args.use_qlora,
+            )
 
     train_dataset, eval_dataset = create_dataset(args.data_dir, processor)
 
@@ -342,7 +353,7 @@ def main():
     # if accelerator.is_main_process:
     #     print(f'Accuracy before finetuning: {acc}')
 
-    if args.use_lora:
+    if args.use_lora and (last_checkpoint_dir is None):
         patch_clip_for_lora(model)
         lora_config = create_lora_config(
             rank=args.lora_rank,

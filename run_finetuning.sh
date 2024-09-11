@@ -13,7 +13,7 @@ torchrun --nproc_per_node=3 --nnodes=$NODES --node_rank=${LOCAL_RANK} --master_a
                             --data_dir /scratch/09697/luosong/databases/quilt_1M \
                             --batch_size $(($NODES * BATCH_SIZE_PER_GPU * 3)) \
                             --batch_size_per_gpu $BATCH_SIZE_PER_GPU \
-                            --num_train_epochs 2 \
+                            --num_train_epochs 3 \
                             --use_flash_attention \
                             --use_qlora \
                             --bf16
