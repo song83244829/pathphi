@@ -1,3 +1,5 @@
+# check continue training script
+
 """
 example for finetuning Phi-3-V on the NLVR2 dataset using the Hugging Face Trainer API
 Modified from Idefics-2 finetuning notebook:
@@ -20,7 +22,7 @@ from pathlib import Path
 import glob
 
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import gather_object
 from datasets import load_dataset
 from tqdm import tqdm
@@ -99,7 +101,7 @@ def create_lora_config(rank, alpha_to_rank_ratio=2.0, dropout=0.0, freeze_vision
     return lora_config
 
 
-def create_model(model_name_or_path, use_flash_attention=False, use_qlora=False):
+def create_model(model_name_or_path, use_flash_attention=False, use_qlora=False, load_previous_lora=False):
     bnb_config = (
         BitsAndBytesConfig(
             load_in_4bit=True,
@@ -110,16 +112,27 @@ def create_model(model_name_or_path, use_flash_attention=False, use_qlora=False)
         else None
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        # Phi-3-V is originally trained in bf16 + flash attn
-        # For fp16 mixed precision training, load in f32 to avoid hf accelerate error
-        torch_dtype=torch.bfloat16 if use_flash_attention else torch.float32,
-        trust_remote_code=True,
-        _attn_implementation='flash_attention_2' if use_flash_attention else 'eager',
-        quantization_config=bnb_config,
-        cache_dir="/scratch/09697/luosong/cache",
-    )
+    if load_previous_lora:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            # Phi-3-V is originally trained in bf16 + flash attn
+            # For fp16 mixed precision training, load in f32 to avoid hf accelerate error
+            torch_dtype=torch.bfloat16 if use_flash_attention else torch.float32,
+            trust_remote_code=True,
+            _attn_implementation='flash_attention_2' if use_flash_attention else 'eager',
+            cache_dir="/scratch/09697/luosong/cache",
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            # Phi-3-V is originally trained in bf16 + flash attn
+            # For fp16 mixed precision training, load in f32 to avoid hf accelerate error
+            torch_dtype=torch.bfloat16 if use_flash_attention else torch.float32,
+            trust_remote_code=True,
+            _attn_implementation='flash_attention_2' if use_flash_attention else 'eager',
+            quantization_config=bnb_config,
+            cache_dir="/scratch/09697/luosong/cache",
+        )
 
     return model
 
@@ -256,7 +269,8 @@ def main():
     if args.use_flash_attention:
         args.bf16 = True
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
+
 
     with accelerator.local_main_process_first():
         processor = AutoProcessor.from_pretrained(
@@ -273,8 +287,11 @@ def main():
                 last_checkpoint_dir,
                 use_flash_attention=args.use_flash_attention,
                 use_qlora=args.use_qlora,
+                load_previous_lora=True,
             )
-
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            model = model.to(f'cuda:{local_rank}')
+            
         else:
             model = create_model(
                 args.model_name_or_path,
@@ -342,27 +359,29 @@ def main():
     if not args.use_qlora:
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         model = model.to(f'cuda:{local_rank}')
+
     # acc = evaluate(
     #     model,
     #     processor,
     #     eval_dataset,
-    #     save_path=out_path / 'eval_before.json',
+    #     save_path=out_path / 'eval_before_last_save.json',
     #     disable_tqdm=not args.tqdm,
     #     eval_batch_size = args.batch_size
     # )
     # if accelerator.is_main_process:
     #     print(f'Accuracy before finetuning: {acc}')
 
-    if args.use_lora and (last_checkpoint_dir is None):
+    if args.use_lora:
         patch_clip_for_lora(model)
-        lora_config = create_lora_config(
-            rank=args.lora_rank,
-            alpha_to_rank_ratio=args.lora_alpha_ratio,
-            dropout=args.lora_dropout,
-            freeze_vision_model=args.freeze_vision_model,
-        )
-        model.add_adapter(lora_config)
-        model.enable_adapters()
+        if last_checkpoint_dir is None:
+            lora_config = create_lora_config(
+                rank=args.lora_rank,
+                alpha_to_rank_ratio=args.lora_alpha_ratio,
+                dropout=args.lora_dropout,
+                freeze_vision_model=args.freeze_vision_model,
+            )
+            model.add_adapter(lora_config)
+            model.enable_adapters()
 
     if args.freeze_vision_model:
         model.model.vision_embed_tokens.requires_grad_(False)
@@ -398,6 +417,7 @@ def main():
             torch_dtype=torch.bfloat16 if args.use_flash_attention else torch.float32,
             trust_remote_code=True,
             _attn_implementation='flash_attention_2' if args.use_flash_attention else 'eager',
+            cache_dir="/scratch/09697/luosong/cache",
         )
         patch_clip_for_lora(model)
         model.load_adapter(training_args.output_dir)

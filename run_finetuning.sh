@@ -2,7 +2,7 @@
 HOST=$1
 NODES=$2
 LOCAL_RANK=${PMI_RANK}
-BATCH_SIZE_PER_GPU=4
+BATCH_SIZE_PER_GPU=2
 
 module unload python3/3.9.7
 export CUDA_HOME=/opt/apps/cuda/12.0/
